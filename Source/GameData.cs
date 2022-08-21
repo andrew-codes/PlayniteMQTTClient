@@ -45,8 +45,11 @@ namespace MQTTClient
 
         public readonly double Brightness;
 
+        public readonly Game RawData;
+
         public GameData(Game game, Color color)
         {
+            RawData = game;
             Name = game.Name;
             Id = game.GameId;
             Description = game.Description;

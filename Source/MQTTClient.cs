@@ -88,7 +88,7 @@ namespace MQTTClient
         public Task StartDisconnect(bool notify = false)
         {
             var task = Task.CompletedTask;
-            
+
             if (client.IsConnected)
             {
                 if (topicHelper.TryGetTopic(Topics.ConnectionSubTopic, out var connectionTopic) &&
@@ -97,7 +97,7 @@ namespace MQTTClient
                     task = client.PublishStringAsync(connectionTopic, "offline", retain: true)
                         .ContinueWith(async t => await client.PublishStringAsync(selectedGameStatusTopic, "offline", retain: true));
                 }
-                
+
                 task = task.ContinueWith(async r => await client.DisconnectAsync())
                     .ContinueWith(
                         t =>
@@ -324,7 +324,7 @@ namespace MQTTClient
 
         #region Overrides of Plugin
 
-        public override Guid Id { get; } = Guid.Parse("90c44048-4f8f-43f7-a0c1-f8164bf1d7ef");
+        public override Guid Id { get; } = Guid.Parse("6d116e57-cebb-4ef0-a1ed-030a8aa6a7e7");
 
         public override void OnLibraryUpdated(OnLibraryUpdatedEventArgs args)
         {
@@ -335,6 +335,31 @@ namespace MQTTClient
                     Task.Run(async () => await discoveryModule.UpdateSelectedGamesDiscovery(), arg.CancelToken).Wait(arg.CancelToken);
                 },
                 new GlobalProgressOptions("Updating Selectable Games MQQT Discovery Topic"));
+
+            var publishGamesDataTasks = PlayniteApi.Database.Games.SelectMany(game => (
+                new List<Task>() {
+                    Task.Run(async () =>await  PublishGame($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}", game, await GetCoverData(game.CoverImage), false)),
+                    Task.Run(async () =>await  PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}", game.CoverImage, MqttQualityOfServiceLevel.AtMostOnce, false)),
+                    Task.Run(async () =>await  PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}", game.BackgroundImage, MqttQualityOfServiceLevel.AtMostOnce, false)),
+                    Task.Run(async () =>await  PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}", game.CoverImage, MqttQualityOfServiceLevel.AtMostOnce, false)),
+                })
+                .Concat(game.Platforms.SelectMany(platform => (
+                    new List<Task>() {
+                            Task.Run(async () =>await PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}/platform/{platform.Id}/cover", platform.Cover, MqttQualityOfServiceLevel.AtMostOnce, false)),
+                            Task.Run(async () =>await PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}/platform/{platform.Id}/background", platform.Cover, MqttQualityOfServiceLevel.AtMostOnce, false)),
+                            Task.Run(async () =>await PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}/platform/{platform.Id}/icon", platform.Cover, MqttQualityOfServiceLevel.AtMostOnce, false)),
+                    })
+                ))
+            );
+
+
+            PlayniteApi.Dialogs.ActivateGlobalProgress(
+                arg =>
+                {
+                    arg.CurrentProgressValue = -1;
+                    Task.WhenAll(publishGamesDataTasks).Wait(arg.CancelToken);
+                },
+                new GlobalProgressOptions("Publishing library game updates"));
 
         }
 
