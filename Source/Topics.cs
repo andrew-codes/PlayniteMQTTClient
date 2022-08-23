@@ -44,6 +44,6 @@
         
         public const string ActiveViewCommandSubTopic = "active_view/commands";
 
-        public const string LibraryGameSubTopic = "library/game";
+        public const string LibrarySubTopic = "library";
     }
 }

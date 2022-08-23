@@ -1,18 +1,13 @@
-﻿
-using ColorThiefDotNet;
-using MQTTClient.Discovery;
-using MQTTClient.Helpers;
+﻿using MQTTClient.Helpers;
 using MQTTnet;
 using MQTTnet.Client;
 using MQTTnet.Protocol;
-using Newtonsoft.Json;
 using Playnite.SDK;
 using Playnite.SDK.Events;
 using Playnite.SDK.Models;
 using Playnite.SDK.Plugins;
 using System;
 using System.Collections.Generic;
-using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -21,474 +16,357 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Controls;
-using Color = System.Drawing.Color;
-using Image = System.Drawing.Image;
 
 namespace MQTTClient
 {
-    public class MQTTClient : GenericPlugin
-    {
-        private static readonly ILogger logger = LogManager.GetLogger();
+	public class MQTTClient : GenericPlugin
+	{
+		private static readonly ILogger logger = LogManager.GetLogger();
 
-        private readonly List<MainMenuItem> mainMenuItems;
+		private readonly List<MainMenuItem> mainMenuItems;
 
-        private readonly List<SidebarItem> sidebarItems;
+		private readonly List<SidebarItem> sidebarItems;
 
-        private readonly SidebarItem progressSidebar;
+		private readonly SidebarItem progressSidebar;
 
-        private readonly MqttClient client;
+		private readonly MqttClient client;
 
-        private readonly MQTTClientSettingsViewModel settings;
+		private readonly MQTTClientSettingsViewModel settings;
 
-        private readonly TopicHelper topicHelper;
+		private readonly TopicHelper topicHelper;
 
-        private readonly ColorThief colorThief;
+		private readonly ObjectSerializer serializer;
 
-        private readonly DiscoveryModule discoveryModule;
+		public MQTTClient(IPlayniteAPI api) : base(api)
+		{
+			serializer = new ObjectSerializer();
+			settings = new MQTTClientSettingsViewModel(this);
+			Properties = new GenericPluginProperties
+			{
+				HasSettings = true
+			};
 
-        private readonly ObjectSerializer serializer;
+			client = new MqttFactory().CreateMqttClient();
+			topicHelper = new TopicHelper(client, settings);
+			progressSidebar = new SidebarItem
+			{
+				Visible = true,
+				Title = "MQTT",
+				Icon = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "Resources", "icon.png"),
+				Activated = SideButtonActivated
+			};
+			sidebarItems = new List<SidebarItem>
+			{
+				progressSidebar
+			};
+			mainMenuItems = new List<MainMenuItem>
+			{
+				new MainMenuItem
+				{
+					Description = "Reconnect", MenuSection = "@MQTT Client", Action = ReconnectMenuAction
+				},
+				new MainMenuItem
+				{
+					Description = "Disconnect", MenuSection = "@MQTT Client", Action = DisconnectMenuAction
+				}
+			};
+		}
 
-        public MQTTClient(IPlayniteAPI api) : base(api)
-        {
-            serializer = new ObjectSerializer();
-            settings = new MQTTClientSettingsViewModel(this);
-            Properties = new GenericPluginProperties
-            {
-                HasSettings = true
-            };
+		public Task StartDisconnect(bool notify = false)
+		{
+			var task = Task.CompletedTask;
 
-            client = new MqttFactory().CreateMqttClient();
-            topicHelper = new TopicHelper(client, settings);
-            discoveryModule = new DiscoveryModule(settings, PlayniteApi, topicHelper, client, serializer);
-            colorThief = new ColorThief();
-            progressSidebar = new SidebarItem
-            {
-                Visible = true,
-                Title = "MQTT",
-                Icon = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "Resources", "icon.png"),
-                Activated = SideButtonActivated
-            };
-            sidebarItems = new List<SidebarItem>
-            {
-                progressSidebar
-            };
-            mainMenuItems = new List<MainMenuItem>
-            {
-                new MainMenuItem
-                {
-                    Description = "Reconnect", MenuSection = "@MQTT Client", Action = ReconnectMenuAction
-                },
-                new MainMenuItem
-                {
-                    Description = "Disconnect", MenuSection = "@MQTT Client", Action = DisconnectMenuAction
-                }
-            };
-        }
+			if (client.IsConnected)
+			{
+				if (topicHelper.TryGetTopic(Topics.ConnectionSubTopic, out var connectionTopic) &&
+					topicHelper.TryGetTopic(Topics.SelectedGameStatusSubTopic, out var selectedGameStatusTopic))
+				{
+					task = client.PublishStringAsync(connectionTopic, "offline", retain: true)
+						.ContinueWith(async t => await client.PublishStringAsync(selectedGameStatusTopic, "offline", retain: true));
+				}
 
-        public Task StartDisconnect(bool notify = false)
-        {
-            var task = Task.CompletedTask;
+				task = task.ContinueWith(async r => await client.DisconnectAsync())
+					.ContinueWith(
+						t =>
+						{
+							if (notify && !client.IsConnected)
+							{
+								PlayniteApi.Dialogs.ShowMessage("MQTT Disconnected");
+							}
+						});
+			}
 
-            if (client.IsConnected)
-            {
-                if (topicHelper.TryGetTopic(Topics.ConnectionSubTopic, out var connectionTopic) &&
-                    topicHelper.TryGetTopic(Topics.SelectedGameStatusSubTopic, out var selectedGameStatusTopic))
-                {
-                    task = client.PublishStringAsync(connectionTopic, "offline", retain: true)
-                        .ContinueWith(async t => await client.PublishStringAsync(selectedGameStatusTopic, "offline", retain: true));
-                }
+			return task;
+		}
 
-                task = task.ContinueWith(async r => await client.DisconnectAsync())
-                    .ContinueWith(
-                        t =>
-                        {
-                            if (notify && !client.IsConnected)
-                            {
-                                PlayniteApi.Dialogs.ShowMessage("MQTT Disconnected");
-                            }
-                        });
-            }
+		public GlobalProgressResult StartConnection(bool notifyCompletion = false)
+		{
+			if (client.IsConnected)
+			{
+				PlayniteApi.Notifications.Add(
+					new NotificationMessage(Guid.NewGuid().ToString(), "Connection to MQTT underway", NotificationType.Error));
+				throw new Exception("Connection to MQTT underway");
+			}
 
-            return task;
-        }
+			return PlayniteApi.Dialogs.ActivateGlobalProgress(
+				args =>
+				{
+					args.CurrentProgressValue = -1;
+					var optionsUnBuilt = new MqttClientOptionsBuilder().WithClientId(settings.Settings.ClientId)
+						.WithTcpServer(settings.Settings.ServerAddress, settings.Settings.Port)
+						.WithCredentials(settings.Settings.Username, LoadPassword())
+						.WithCleanSession();
 
-        public GlobalProgressResult StartConnection(bool notifyCompletion = false)
-        {
-            if (client.IsConnected)
-            {
-                PlayniteApi.Notifications.Add(
-                    new NotificationMessage(Guid.NewGuid().ToString(), "Connection to MQTT underway", NotificationType.Error));
-                throw new Exception("Connection to MQTT underway");
-            }
+					if (settings.Settings.UseSecureConnection)
+					{
+						optionsUnBuilt = optionsUnBuilt.WithTls();
+					}
 
-            return PlayniteApi.Dialogs.ActivateGlobalProgress(
-                args =>
-                {
-                    args.CurrentProgressValue = -1;
-                    var optionsUnBuilt = new MqttClientOptionsBuilder().WithClientId(settings.Settings.ClientId)
-                        .WithTcpServer(settings.Settings.ServerAddress, settings.Settings.Port)
-                        .WithCredentials(settings.Settings.Username, LoadPassword())
-                        .WithCleanSession();
+					var options = optionsUnBuilt.Build();
 
-                    if (settings.Settings.UseSecureConnection)
-                    {
-                        optionsUnBuilt = optionsUnBuilt.WithTls();
-                    }
+					client.ConnectAsync(options, args.CancelToken)
+						.ContinueWith(
+							t =>
+							{
+								if (t.Exception != null)
+								{
+									PlayniteApi.Dialogs.ShowErrorMessage(
+										$"MQTT: {string.Join(",", t.Exception.InnerExceptions.Select(i => i.Message))}",
+										"MQTT Error");
+								}
+								else
+								{
+									if (notifyCompletion && client.IsConnected)
+									{
+										PlayniteApi.Dialogs.ShowMessage("MQTT Connected");
+									}
+								}
+							},
+							args.CancelToken)
+						.Wait(args.CancelToken);
+				},
+				new GlobalProgressOptions($"Connection to MQTT ({settings.Settings.ServerAddress}:{settings.Settings.Port}) and initial publishing of library.", true));
+		}
 
-                    var options = optionsUnBuilt.Build();
+		private string LoadPassword()
+		{
+			if (settings.Settings.Password == null)
+			{
+				return "";
+			}
 
-                    client.ConnectAsync(options, args.CancelToken)
-                        .ContinueWith(
-                            t =>
-                            {
-                                if (t.Exception != null)
-                                {
-                                    PlayniteApi.Dialogs.ShowErrorMessage(
-                                        $"MQTT: {string.Join(",", t.Exception.InnerExceptions.Select(i => i.Message))}",
-                                        "MQTT Error");
-                                }
-                                else
-                                {
-                                    if (notifyCompletion && client.IsConnected)
-                                    {
-                                        PlayniteApi.Dialogs.ShowMessage("MQTT Connected");
-                                    }
-                                }
-                            },
-                            args.CancelToken)
-                        .Wait(args.CancelToken);
-                },
-                new GlobalProgressOptions($"Connection to MQTT ({settings.Settings.ServerAddress}:{settings.Settings.Port})", true));
-        }
+			return Encoding.UTF8.GetString(ProtectedData.Unprotect(settings.Settings.Password, Id.ToByteArray(), DataProtectionScope.CurrentUser));
+		}
 
-        private string LoadPassword()
-        {
-            if (settings.Settings.Password == null)
-            {
-                return "";
-            }
+		private void SideButtonActivated()
+		{
+			if (client.IsConnected)
+			{
+				StartDisconnect(true);
+			}
+			else
+			{
+				StartConnection(true);
+			}
+		}
 
-            return Encoding.UTF8.GetString(ProtectedData.Unprotect(settings.Settings.Password, Id.ToByteArray(), DataProtectionScope.CurrentUser));
-        }
+		private async Task ClientOnConnectedAsync(EventArgs eventArgs)
+		{
+			logger.Debug("MQTT client connected");
+			progressSidebar.ProgressValue = 100;
 
-        private void SideButtonActivated()
-        {
-            if (client.IsConnected)
-            {
-                StartDisconnect(true);
-            }
-            else
-            {
-                StartConnection(true);
-            }
-        }
+			if (topicHelper.TryGetTopic(Topics.ConnectionSubTopic, out var connectionTopic))
+			{
+				await client.PublishStringAsync(connectionTopic, "online", retain: true);
+			}
 
-        private async Task ClientOnConnectedAsync(EventArgs eventArgs)
-        {
-            progressSidebar.ProgressValue = 100;
+			await PublishGames(PlayniteApi.Database.Games);
+			PlayniteApi.Database.Games.ItemCollectionChanged += Games_ItemCollectionChanged;
+			PlayniteApi.Database.Games.ItemUpdated += Games_ItemUpdated;
+		}
 
-            if (topicHelper.TryGetTopic(Topics.ConnectionSubTopic, out var connectionTopic))
-            {
-                await client.PublishStringAsync(connectionTopic, "online", retain: true);
-            }
+		private void DisconnectMenuAction(MainMenuItemActionArgs obj)
+		{
+			StartDisconnect().ContinueWith(t => PlayniteApi.Dialogs.ShowMessage("MQTT Disconnected Successfully")).Wait(TimeSpan.FromSeconds(3));
+		}
 
-            await UpdateSelectedGames(PlayniteApi.MainView.SelectedGames);
+		private void ReconnectMenuAction(MainMenuItemActionArgs obj)
+		{
+			StartDisconnect().ContinueWith(r => StartConnection(true)).Wait();
+		}
 
-            if (topicHelper.TryGetTopic(Topics.ActiveViewSubTopic, out var activeViewTopic))
-            {
-                await client.PublishStringAsync(activeViewTopic, PlayniteApi.MainView.ActiveDesktopView.ToString());
-            }
+		private Task ClientOnDisconnectedAsync(EventArgs eventArgs)
+		{
+			PlayniteApi.Database.Games.ItemCollectionChanged -= Games_ItemCollectionChanged;
+			PlayniteApi.Database.Games.ItemUpdated -= Games_ItemUpdated;
+			progressSidebar.ProgressValue = -1;
+			return Task.CompletedTask;
+		}
 
-            await discoveryModule.Initialize();
-        }
+		private async Task<MqttClientPublishResult> PublishFileAsync(
+			string topic,
+			string filePath = null,
+			MqttQualityOfServiceLevel qualityOfServiceLevel = MqttQualityOfServiceLevel.AtMostOnce,
+			bool retain = false,
+			CancellationToken cancellationToken = default)
+		{
+			if (!string.IsNullOrEmpty(filePath))
+			{
+				var coverPath = PlayniteApi.Database.GetFullFilePath(filePath);
+				if (File.Exists(coverPath))
+				{
+					using (var fileStream = File.OpenRead(coverPath))
+					{
+						var result = new byte[fileStream.Length];
+						await fileStream.ReadAsync(result, 0, result.Length, cancellationToken);
+						return await client.PublishBinaryAsync(
+							topic,
+							result,
+							retain: retain,
+							qualityOfServiceLevel: qualityOfServiceLevel,
+							cancellationToken: cancellationToken);
+					}
+				}
+			}
 
-        private void DisconnectMenuAction(MainMenuItemActionArgs obj)
-        {
-            StartDisconnect().ContinueWith(t => PlayniteApi.Dialogs.ShowMessage("MQTT Disconnected Successfully")).Wait(TimeSpan.FromSeconds(3));
-        }
+			return await client.PublishBinaryAsync(
+				topic,
+				retain: retain,
+				qualityOfServiceLevel: qualityOfServiceLevel,
+				cancellationToken: cancellationToken);
+		}
 
-        private void ReconnectMenuAction(MainMenuItemActionArgs obj)
-        {
-            StartDisconnect().ContinueWith(r => StartConnection(true)).Wait();
-        }
+		private async Task PublishGames(IEnumerable<Game> games, bool isUpdate = false)
+		{
+			if (!games.Any())
+			{
+				return;
+			}
 
-        private Task ClientOnDisconnectedAsync(EventArgs eventArgs)
-        {
-            progressSidebar.ProgressValue = -1;
-            return Task.CompletedTask;
-        }
+			logger.Info("Publishing game library.");
+			var topicPart = $"playnite/{Topics.LibrarySubTopic}";
+			if (isUpdate)
+			{
+				logger.Debug("Publishing as updates.");
+				topicPart = $"{topicPart}/update";
+			}
 
-        private async Task<MqttClientPublishResult> PublishFileAsync(
-            string topic,
-            string filePath = null,
-            MqttQualityOfServiceLevel qualityOfServiceLevel = MqttQualityOfServiceLevel.AtMostOnce,
-            bool retain = false,
-            CancellationToken cancellationToken = default)
-        {
-            if (!string.IsNullOrEmpty(filePath))
-            {
-                var coverPath = PlayniteApi.Database.GetFullFilePath(filePath);
-                if (File.Exists(coverPath))
-                {
-                    using (var fileStream = File.OpenRead(coverPath))
-                    {
-                        var result = new byte[fileStream.Length];
-                        await fileStream.ReadAsync(result, 0, result.Length, cancellationToken);
-                        return await client.PublishBinaryAsync(
-                            topic,
-                            result,
-                            retain: retain,
-                            qualityOfServiceLevel: qualityOfServiceLevel,
-                            cancellationToken: cancellationToken);
-                    }
-                }
-            }
+			logger.Info($"Publishing {games.Count()} games.");
+			await client.PublishStringAsync($"{topicPart}/games/attributes", serializer.Serialize(games), retain: false, qualityOfServiceLevel: MqttQualityOfServiceLevel.AtLeastOnce);
 
-            return await client.PublishBinaryAsync(
-                topic,
-                retain: retain,
-                qualityOfServiceLevel: qualityOfServiceLevel,
-                cancellationToken: cancellationToken);
-        }
+			var platforms = games.SelectMany(game => game.Platforms).Distinct();
+			logger.Info($"Publishing {platforms.Count()} platforms.");
+			await client.PublishStringAsync($"{topicPart}/platforms/attributes", serializer.Serialize(platforms), retain: false, qualityOfServiceLevel: MqttQualityOfServiceLevel.AtLeastOnce);
 
-        private async Task<ArraySegment<byte>?> GetCoverData(string path)
-        {
-            if (!string.IsNullOrEmpty(path) && File.Exists(PlayniteApi.Database.GetFullFilePath(path)))
-            {
-                using (FileStream fileStream = new FileStream(PlayniteApi.Database.GetFullFilePath(path), FileMode.Open))
-                {
-                    byte[] buffer = new byte[fileStream.Length];
-                    int length = await fileStream.ReadAsync(buffer, 0, buffer.Length);
-                    return new ArraySegment<byte>(buffer, 0, length);
-                }
-            }
+			foreach (var game in games)
+			{
+				await PublishFileAsync($"{topicPart}/game/{game.Id}/attributes/cover", game.CoverImage, MqttQualityOfServiceLevel.AtLeastOnce, false);
+				await PublishFileAsync($"{topicPart}/game/{game.Id}/attributes/background", game.BackgroundImage, MqttQualityOfServiceLevel.AtLeastOnce, false);
+			}
+			foreach (var platform in platforms)
+			{
+				await PublishFileAsync($"{topicPart}/platform/{platform.Id}/attributes/cover", platform.Cover, MqttQualityOfServiceLevel.AtLeastOnce, false);
+				await PublishFileAsync($"{topicPart}/platform/{platform.Id}/attributes/background", platform.Background, MqttQualityOfServiceLevel.AtLeastOnce, false);
+				await PublishFileAsync($"{topicPart}/platform/{platform.Id}/attributes/icon", platform.Icon, MqttQualityOfServiceLevel.AtLeastOnce, false);
+			}
+		}
 
-            return null;
-        }
+		private void Games_ItemUpdated(object sender, ItemUpdatedEventArgs<Game> e)
+		{
+			logger.Debug($"{e.UpdatedItems.Count()} updated games to be published.");
+			var games = e.UpdatedItems.Where(shouldPublishPropertyUpdate).Select(game => game.NewData);
+			Task.Run(async () => await PublishGames(games, true)).Wait(CancellationToken.None);
+		}
 
-        private async Task PublishGame(string topic, Game game, ArraySegment<byte>? coverData, bool retain)
-        {
-            var color = new ColorThiefDotNet.Color();
-            if (settings.Settings.PublishCoverColors)
-            {
-                if (coverData?.Array != null)
-                {
-                    using (var memoryStream = new MemoryStream(coverData.Value.Array, coverData.Value.Offset, coverData.Value.Count, false))
-                    {
-                        color = colorThief.GetColor(new Bitmap(memoryStream)).Color;
-                    }
-                }
-            }
+		private bool shouldPublishPropertyUpdate(ItemUpdateEvent<Game> arg)
+		{
+			return true;
+		}
 
-            await client.PublishStringAsync(topic, serializer.Serialize(new GameData(game, color)), retain: retain);
-        }
+		private void Games_ItemCollectionChanged(object sender, ItemCollectionChangedEventArgs<Game> e)
+		{
+			logger.Debug($"{e.AddedItems.Count()} added games to be published.");
+			Task.Run(async () => await PublishGames(e.AddedItems, true)).Wait(CancellationToken.None);
+		}
 
-        private async Task UpdateSelectedGames(IEnumerable<Game> selectedGames)
-        {
-            var first = selectedGames.FirstOrDefault();
-            if (first != null)
-            {
-                if (topicHelper.TryGetTopic(Topics.SelectedGameStatusSubTopic, out var statusTopic) &&
-                    topicHelper.TryGetTopic(Topics.SelectedGameAttributesSubTopic, out var attributesTopic) &&
-                    topicHelper.TryGetTopic(Topics.SelectedGameCoverSubTopic, out var selectedGameCoverSubTopic))
-                {
-                    await client.PublishStringAsync(statusTopic, "online", retain: true);
-                    var cover = settings.Settings.PublishCover || settings.Settings.PublishCoverColors ? await GetCoverData(first.CoverImage) : null;
-                    await PublishGame(attributesTopic, first, cover, true);
+		#region Overrides of Plugin
 
-                    if (settings.Settings.PublishCover)
-                    {
-                        if (!cover.HasValue)
-                        {
-                            cover = await GetCoverData(first.Platforms.FirstOrDefault(p => !string.IsNullOrEmpty(p.Cover))?.Cover);
-                        }
-                        if (cover.HasValue)
-                        {
-                            await client.PublishBinaryAsync(selectedGameCoverSubTopic, cover.Value, retain: true);
-                        }
-                    }
-                }
-            }
-            else
-            {
-                if (topicHelper.TryGetTopic(Topics.SelectedGameStatusSubTopic, out var statusTopic) &&
-                    topicHelper.TryGetTopic(Topics.SelectedGameAttributesSubTopic, out var attributesTopic) &&
-                    topicHelper.TryGetTopic(Topics.SelectedGameCoverSubTopic, out var selectedGameCoverSubTopic))
-                {
-                    await client.PublishStringAsync(statusTopic, "offline", retain: true);
-                    await client.PublishStringAsync(attributesTopic, retain: true);
-                    await PublishFileAsync(selectedGameCoverSubTopic, retain: true);
-                }
-            }
-        }
+		public override Guid Id { get; } = Guid.Parse("6d116e57-cebb-4ef0-a1ed-030a8aa6a7e7");
 
-        #region Overrides of Plugin
+		public override void OnLibraryUpdated(OnLibraryUpdatedEventArgs args)
+		{
+		}
 
-        public override Guid Id { get; } = Guid.Parse("6d116e57-cebb-4ef0-a1ed-030a8aa6a7e7");
+		public override void Dispose()
+		{
+			client.Dispose();
+			base.Dispose();
+		}
 
-        public override void OnLibraryUpdated(OnLibraryUpdatedEventArgs args)
-        {
-            PlayniteApi.Dialogs.ActivateGlobalProgress(
-                arg =>
-                {
-                    arg.CurrentProgressValue = -1;
-                    Task.Run(async () => await discoveryModule.UpdateSelectedGamesDiscovery(), arg.CancelToken).Wait(arg.CancelToken);
-                },
-                new GlobalProgressOptions("Updating Selectable Games MQQT Discovery Topic"));
+		public override void OnGameInstalled(OnGameInstalledEventArgs args)
+		{
+			Task.Run(
+				async () => await client.PublishStringAsync($"playnite/{Topics.LibrarySubTopic}/game/{args.Game.Id}/state", "installed", retain: false, qualityOfServiceLevel: MqttQualityOfServiceLevel.AtLeastOnce));
+		}
 
-            var publishGamesDataTasks = PlayniteApi.Database.Games.SelectMany(game => (
-                new List<Task>() {
-                    Task.Run(async () =>await  PublishGame($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}", game, await GetCoverData(game.CoverImage), false)),
-                    Task.Run(async () =>await  PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}", game.CoverImage, MqttQualityOfServiceLevel.AtMostOnce, false)),
-                    Task.Run(async () =>await  PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}", game.BackgroundImage, MqttQualityOfServiceLevel.AtMostOnce, false)),
-                    Task.Run(async () =>await  PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}", game.CoverImage, MqttQualityOfServiceLevel.AtMostOnce, false)),
-                })
-                .Concat(game.Platforms.SelectMany(platform => (
-                    new List<Task>() {
-                            Task.Run(async () =>await PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}/platform/{platform.Id}/cover", platform.Cover, MqttQualityOfServiceLevel.AtMostOnce, false)),
-                            Task.Run(async () =>await PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}/platform/{platform.Id}/background", platform.Cover, MqttQualityOfServiceLevel.AtMostOnce, false)),
-                            Task.Run(async () =>await PublishFileAsync($"playnite/{Topics.LibraryGameSubTopic}/{game.Id}/platform/{platform.Id}/icon", platform.Cover, MqttQualityOfServiceLevel.AtMostOnce, false)),
-                    })
-                ))
-            );
+		public override void OnGameStarted(OnGameStartedEventArgs args)
+		{
+			Task.Run(
+				async () => await client.PublishStringAsync($"playnite/{Topics.LibrarySubTopic}/game/{args.Game.Id}/state", "started", retain: false, qualityOfServiceLevel: MqttQualityOfServiceLevel.AtLeastOnce));
+		}
 
+		public override void OnGameStarting(OnGameStartingEventArgs args)
+		{
+			Task.Run(
+				async () => await client.PublishStringAsync($"playnite/{Topics.LibrarySubTopic}/game/{args.Game.Id}/state", "starting", retain: false, qualityOfServiceLevel: MqttQualityOfServiceLevel.AtLeastOnce));
+		}
 
-            PlayniteApi.Dialogs.ActivateGlobalProgress(
-                arg =>
-                {
-                    arg.CurrentProgressValue = -1;
-                    Task.WhenAll(publishGamesDataTasks).Wait(arg.CancelToken);
-                },
-                new GlobalProgressOptions("Publishing library game updates"));
+		public override void OnGameStopped(OnGameStoppedEventArgs args)
+		{
+			Task.Run(
+				async () => await client.PublishStringAsync($"playnite/{Topics.LibrarySubTopic}/game/{args.Game.Id}/state", "stopped", retain: false, qualityOfServiceLevel: MqttQualityOfServiceLevel.AtLeastOnce));
+		}
 
-        }
+		public override void OnGameUninstalled(OnGameUninstalledEventArgs args)
+		{
+			Task.Run(
+				async () => await client.PublishStringAsync($"playnite/{Topics.LibrarySubTopic}/game/{args.Game.Id}/state", "uninstalled", retain: false, qualityOfServiceLevel: MqttQualityOfServiceLevel.AtLeastOnce));
+		}
 
-        public override void Dispose()
-        {
-            client.Dispose();
-            base.Dispose();
-        }
+		public override void OnApplicationStarted(OnApplicationStartedEventArgs args)
+		{
+			client.ConnectedAsync += ClientOnConnectedAsync;
+			client.DisconnectedAsync += ClientOnDisconnectedAsync;
+			StartConnection();
+		}
 
-        public override void OnGameInstalled(OnGameInstalledEventArgs args)
-        {
-            if (topicHelper.TryGetTopic(Topics.InstalledDataSubTopic, out var topic))
-            {
-                Task.Run(
-                    async () => PublishGame(
-                        topic,
-                        args.Game,
-                        settings.Settings.PublishCover ? await GetCoverData(args.Game.CoverImage) : null,
-                        false));
-            }
-        }
+		public override void OnApplicationStopped(OnApplicationStoppedEventArgs args)
+		{
+			client.ConnectedAsync -= ClientOnConnectedAsync;
+			client.DisconnectedAsync -= ClientOnDisconnectedAsync;
+			StartDisconnect();
+		}
 
-        public override void OnGameStarted(OnGameStartedEventArgs args)
-        {
-            if (topicHelper.TryGetTopic(Topics.CurrentStateSubTopic, out var topic))
-            {
-                client.PublishStringAsync(topic, "ON", retain: true);
-            }
-        }
+		public override IEnumerable<SidebarItem> GetSidebarItems()
+		{
+			return sidebarItems;
+		}
 
-        public override void OnGameStarting(OnGameStartingEventArgs args)
-        {
-            var tasks = Task.CompletedTask;
-            if (topicHelper.TryGetTopic(Topics.CurrentAttributesSubTopic, out var dataTopic) &&
-                topicHelper.TryGetTopic(Topics.CurrentCoverSubTopic, out var currentCoverTopic) &&
-                topicHelper.TryGetTopic(Topics.CurrentBackgroundSubTopic, out var currentBackgroundTopic) &&
-                topicHelper.TryGetTopic(Topics.CurrentIconTopic, out var iconTopic))
-            {
-                tasks = tasks.ContinueWith(async t => await PublishGame(dataTopic, args.Game, await GetCoverData(args.Game.CoverImage), true));
-                tasks = tasks.ContinueWith(
-                    async t => await PublishFileAsync(
-                        currentCoverTopic,
-                        args.Game.CoverImage ?? args.Game.Platforms.FirstOrDefault(p => !string.IsNullOrEmpty(p.Cover))?.Cover,
-                        retain: true));
-                tasks = tasks.ContinueWith(
-                    async t => await PublishFileAsync(
-                        currentBackgroundTopic,
-                        args.Game.BackgroundImage ?? args.Game.Platforms.FirstOrDefault(p => !string.IsNullOrEmpty(p.Background))?.Background,
-                        retain: true));
-                tasks = tasks.ContinueWith(
-                    async t => await PublishFileAsync(
-                        iconTopic,
-                        args.Game.Icon ?? args.Game.Platforms.FirstOrDefault(p => !string.IsNullOrEmpty(p.Icon))?.Icon,
-                        retain: true));
-            }
-        }
+		public override IEnumerable<MainMenuItem> GetMainMenuItems(GetMainMenuItemsArgs args)
+		{
+			return mainMenuItems;
+		}
 
-        public override void OnGameStopped(OnGameStoppedEventArgs args)
-        {
-            var tasks = Task.CompletedTask;
-            if (topicHelper.TryGetTopic(Topics.CurrentStateSubTopic, out var stageTopic))
-            {
-                tasks = tasks.ContinueWith(async t => await client.PublishStringAsync(stageTopic, "OFF", retain: true));
-            }
+		public override ISettings GetSettings(bool firstRunSettings)
+		{
+			return settings;
+		}
 
-            if (topicHelper.TryGetTopic(Topics.CurrentAttributesSubTopic, out var dataTopic) &&
-                topicHelper.TryGetTopic(Topics.CurrentCoverSubTopic, out var currentCoverTopic) &&
-                topicHelper.TryGetTopic(Topics.CurrentBackgroundSubTopic, out var currentBackgroundTopic) &&
-                topicHelper.TryGetTopic(Topics.CurrentIconTopic, out var iconTopic))
-            {
-                tasks.ContinueWith(async t => await client.PublishStringAsync(dataTopic, retain: true));
-                tasks.ContinueWith(async t => await client.PublishStringAsync(currentCoverTopic, retain: true));
-                tasks.ContinueWith(async t => await client.PublishStringAsync(currentBackgroundTopic, retain: true));
-                tasks.ContinueWith(async t => await client.PublishStringAsync(iconTopic, retain: true));
-            }
-        }
+		public override UserControl GetSettingsView(bool firstRunSettings)
+		{
+			return new MQTTClientSettingsView();
+		}
 
-        public override void OnGameUninstalled(OnGameUninstalledEventArgs args)
-        {
-            if (topicHelper.TryGetTopic(Topics.UninstalledDataSubTopic, out var topic))
-            {
-                Task.Run(
-                    async () => await PublishGame(
-                        topic,
-                        args.Game,
-                        settings.Settings.PublishCover ? await GetCoverData(args.Game.CoverImage) : null,
-                        false));
-            }
-        }
-
-        public override void OnApplicationStarted(OnApplicationStartedEventArgs args)
-        {
-            client.ConnectedAsync += ClientOnConnectedAsync;
-            client.DisconnectedAsync += ClientOnDisconnectedAsync;
-            StartConnection();
-        }
-
-        public override void OnApplicationStopped(OnApplicationStoppedEventArgs args)
-        {
-            client.ConnectedAsync -= ClientOnConnectedAsync;
-            client.DisconnectedAsync -= ClientOnDisconnectedAsync;
-            StartDisconnect();
-        }
-
-        public override void OnGameSelected(OnGameSelectedEventArgs args)
-        {
-            Task.Run(() => UpdateSelectedGames(args.NewValue));
-        }
-
-        public override IEnumerable<SidebarItem> GetSidebarItems()
-        {
-            return sidebarItems;
-        }
-
-        public override IEnumerable<MainMenuItem> GetMainMenuItems(GetMainMenuItemsArgs args)
-        {
-            return mainMenuItems;
-        }
-
-        public override ISettings GetSettings(bool firstRunSettings)
-        {
-            return settings;
-        }
-
-        public override UserControl GetSettingsView(bool firstRunSettings)
-        {
-            return new MQTTClientSettingsView();
-        }
-
-        #endregion
-    }
+		#endregion
+	}
 }
